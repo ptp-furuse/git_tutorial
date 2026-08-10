@@ -107,7 +107,7 @@
     <div class="field">
       <label for="inputUrl">URL</label>
       <input id="inputUrl" type="text" placeholder="https://example.com">
-      <span class="hint">サイトのトップURL、またはsitemap.xmlの直接URLを入力してください（パス部分は無視され、サイトのオリジン直下の /sitemap.xml を取得します）。</span>
+      <span class="hint">クロールを開始するURLを入力してください。このページ内のリンクを同一サイト内でたどってページ一覧を作成します（外部サイトへのリンクはたどりません）。</span>
     </div>
     <div class="field">
       <label for="inputKeyword">キーワード（任意）</label>
@@ -121,7 +121,7 @@
     <div class="field">
       <label for="inputMaxPages">最大取得件数</label>
       <input id="inputMaxPages" type="number" value="50" min="1" max="1000">
-      <span class="hint">サイトマップのページ数が多い場合、ブラウザの負荷を抑えるためこの件数までを取得します。</span>
+      <span class="hint">サイト内のページ数が多い場合、ブラウザの負荷を抑えるためこの件数までを取得します。</span>
     </div>
     <button id="btnRun">取得</button>
   </section>
@@ -146,8 +146,6 @@
 
   // ---- Config constants ----
   var CONCURRENCY = 8;
-  var MAX_SITEMAP_DEPTH = 3;
-  var MAX_SITEMAPS_TOTAL = 50;
 
   // ---- State ----
   var pages = []; // { url, title, urlEn, error }[]
@@ -209,21 +207,13 @@
     );
   }
 
-  function parseXml(text) {
-    var doc = new DOMParser().parseFromString(text, "text/xml");
-    if (doc.querySelector("parsererror")) {
-      throw new UserFacingError("サイトマップXMLの解析に失敗しました。");
-    }
-    return doc;
-  }
-
   function parseHtml(text) {
     // text/html DOMParser output is inert: scripts don't execute, images/styles don't load.
     return new DOMParser().parseFromString(text, "text/html");
   }
 
   // ---- URL normalization ----
-  function normalizeSitemapUrl(input) {
+  function normalizeStartUrl(input) {
     input = (input || "").trim();
     if (!input) {
       throw new UserFacingError("URLを入力してください。");
@@ -237,10 +227,8 @@
     } catch (e) {
       throw new UserFacingError("入力されたURLが不正です。");
     }
-    if (/\.xml($|\?)/i.test(u.pathname)) {
-      return u.href;
-    }
-    return u.origin + "/sitemap.xml";
+    u.hash = "";
+    return u.href;
   }
 
   function clampMaxPages(rawValue) {
@@ -250,125 +238,138 @@
     return n;
   }
 
-  // ---- Sitemap fetch + recursion ----
-  function fetchAllLocUrls(startSitemapUrl) {
-    var seenSitemapUrls = {};
-    var seenSitemapCount = 0;
-    var locUrls = [];
-    var seenLocUrls = {};
+  // ---- Page info extraction ----
+  function extractTitle(doc, url) {
+    var titleEl = doc.querySelector("head > title");
+    var title = titleEl && titleEl.textContent ? titleEl.textContent.trim() : "";
+    if (!title) {
+      var h1 = doc.querySelector("h1");
+      title = h1 && h1.textContent ? h1.textContent.trim() : "";
+    }
+    if (!title) {
+      try {
+        title = new URL(url).pathname || url;
+      } catch (e) {
+        title = url;
+      }
+    }
+    return title;
+  }
 
-    function visit(sitemapUrl, depth) {
-      var normalized = sitemapUrl.split("#")[0];
-      if (seenSitemapUrls[normalized]) return Promise.resolve();
-      if (seenSitemapCount >= MAX_SITEMAPS_TOTAL) return Promise.resolve();
-      if (depth > MAX_SITEMAP_DEPTH) return Promise.resolve();
-      seenSitemapUrls[normalized] = true;
-      seenSitemapCount++;
+  function extractUrlEn(doc, url) {
+    var altEn = doc.querySelector('head link[rel="alternate"][hreflang^="en"]');
+    if (!altEn) return null;
+    var href = altEn.getAttribute("href");
+    if (!href) return null;
+    try {
+      return new URL(href, url).href;
+    } catch (e) {
+      return null;
+    }
+  }
 
-      setStatus("サイトマップ取得中: " + normalized);
-      return fetchText(normalized).then(function (xmlText) {
-        var doc = parseXml(xmlText);
-        var root = doc.documentElement;
-        var rootName = root ? root.localName : null;
+  function extractSameOriginLinks(doc, baseUrl, origin) {
+    var links = [];
+    var anchors = doc.querySelectorAll("a[href]");
+    for (var i = 0; i < anchors.length; i++) {
+      var href = anchors[i].getAttribute("href");
+      if (!href || /^(mailto:|tel:|javascript:)/i.test(href.trim())) continue;
+      var abs;
+      try {
+        abs = new URL(href, baseUrl);
+      } catch (e) {
+        continue;
+      }
+      if (abs.protocol !== "http:" && abs.protocol !== "https:") continue;
+      if (abs.origin !== origin) continue;
+      abs.hash = "";
+      links.push(abs.href);
+    }
+    return links;
+  }
 
-        if (rootName === "sitemapindex") {
-          var childLocs = Array.prototype.slice
-            .call(doc.querySelectorAll("sitemap > loc"))
-            .map(function (n) { return n.textContent.trim(); });
-          var p = Promise.resolve();
-          childLocs.forEach(function (child) {
-            p = p.then(function () { return visit(child, depth + 1); });
-          });
-          return p;
-        } else if (rootName === "urlset") {
-          var locs = Array.prototype.slice
-            .call(doc.querySelectorAll("url > loc"))
-            .map(function (n) { return n.textContent.trim(); });
-          locs.forEach(function (loc) {
-            if (!seenLocUrls[loc]) {
-              seenLocUrls[loc] = true;
-              locUrls.push(loc);
-            }
-          });
+  // ---- Site crawl (same-origin link traversal, breadth-first) ----
+  function crawlSite(startUrl, maxPages, onProgress) {
+    var origin;
+    try {
+      origin = new URL(startUrl).origin;
+    } catch (e) {
+      return Promise.reject(new UserFacingError("入力されたURLが不正です。"));
+    }
+
+    var seen = {};
+    seen[startUrl] = true;
+    var queue = [startUrl];
+    var results = [];
+    var activeCount = 0;
+
+    return new Promise(function (resolve, reject) {
+      var fatalError = null;
+      var settled = false;
+
+      function finish() {
+        if (settled) return;
+        settled = true;
+        if (fatalError && results.length === 0) {
+          reject(fatalError);
         } else {
-          throw new UserFacingError(
-            "sitemap.xmlの形式が想定と異なります（urlset/sitemapindexが見つかりません）。"
-          );
-        }
-      });
-    }
-
-    return visit(startSitemapUrl, 0).then(function () {
-      return locUrls;
-    });
-  }
-
-  // ---- Per-page fetch ----
-  function fetchPageInfo(url) {
-    return fetchText(url).then(function (html) {
-      var doc = parseHtml(html);
-
-      var titleEl = doc.querySelector("head > title");
-      var title = titleEl && titleEl.textContent ? titleEl.textContent.trim() : "";
-      if (!title) {
-        var h1 = doc.querySelector("h1");
-        title = h1 && h1.textContent ? h1.textContent.trim() : "";
-      }
-      if (!title) {
-        try {
-          title = new URL(url).pathname || url;
-        } catch (e) {
-          title = url;
+          resolve({ results: results, truncated: queue.length > 0 });
         }
       }
 
-      var altEn = doc.querySelector('head link[rel="alternate"][hreflang^="en"]');
-      var urlEn = null;
-      if (altEn) {
-        var href = altEn.getAttribute("href");
-        if (href) {
-          try {
-            urlEn = new URL(href, url).href;
-          } catch (e) {
-            urlEn = null;
-          }
+      function tryFinish() {
+        if (settled) return true;
+        if (activeCount === 0 && (queue.length === 0 || results.length >= maxPages)) {
+          finish();
+          return true;
         }
+        return false;
       }
 
-      return { url: url, title: title, urlEn: urlEn, error: null };
-    });
-  }
+      function pump() {
+        if (settled) return;
+        while (
+          activeCount < CONCURRENCY &&
+          queue.length > 0 &&
+          results.length + activeCount < maxPages
+        ) {
+          let url = queue.shift();
+          activeCount++;
+          fetchText(url)
+            .then(function (html) {
+              var doc = parseHtml(html);
+              results.push({
+                url: url,
+                title: extractTitle(doc, url),
+                urlEn: extractUrlEn(doc, url),
+                error: null
+              });
+              if (results.length + queue.length < maxPages) {
+                extractSameOriginLinks(doc, url, origin).forEach(function (link) {
+                  if (!seen[link] && results.length + queue.length < maxPages) {
+                    seen[link] = true;
+                    queue.push(link);
+                  }
+                });
+              }
+            })
+            .catch(function (e) {
+              if (results.length === 0 && queue.length === 0) {
+                fatalError = e instanceof UserFacingError ? e : new UserFacingError((e && e.message) || String(e));
+              } else {
+                results.push({ url: url, title: url, urlEn: null, error: (e && e.message) || String(e) });
+              }
+            })
+            .then(function () {
+              activeCount--;
+              onProgress(results.length, Math.min(maxPages, results.length + queue.length + activeCount));
+              if (!tryFinish()) pump();
+            });
+        }
+        tryFinish();
+      }
 
-  function fetchAllPageInfo(locUrls, maxPages, onProgress) {
-    var capped = locUrls.slice(0, maxPages);
-    var truncated = locUrls.length > maxPages;
-    var results = new Array(capped.length);
-    var completed = 0;
-    var nextIndex = 0;
-
-    function worker() {
-      if (nextIndex >= capped.length) return Promise.resolve();
-      var i = nextIndex++;
-      var url = capped[i];
-      return fetchPageInfo(url)
-        .catch(function (e) {
-          return { url: url, title: url, urlEn: null, error: (e && e.message) || String(e) };
-        })
-        .then(function (info) {
-          results[i] = info;
-          completed++;
-          onProgress(completed, capped.length);
-          return worker();
-        });
-    }
-
-    var workerCount = Math.min(CONCURRENCY, capped.length);
-    var workers = [];
-    for (var i = 0; i < workerCount; i++) {
-      workers.push(worker());
-    }
-    return Promise.all(workers).then(function () {
-      return { results: results, truncated: truncated };
+      pump();
     });
   }
 
@@ -483,9 +484,9 @@
     pages = [];
     outputText.value = "";
 
-    var sitemapUrl, maxPages;
+    var startUrl, maxPages;
     try {
-      sitemapUrl = normalizeSitemapUrl(inputUrl.value);
+      startUrl = normalizeStartUrl(inputUrl.value);
       maxPages = clampMaxPages(inputMaxPages.value);
     } catch (e) {
       showFatalError(e.message);
@@ -494,27 +495,17 @@
       return;
     }
 
-    fetchAllLocUrls(sitemapUrl)
-      .then(function (locUrls) {
-        if (locUrls.length === 0) {
-          throw new UserFacingError("サイトマップにページが見つかりませんでした。");
-        }
-        setStatus("0/" + Math.min(locUrls.length, maxPages) + " ページ取得中...");
-        return fetchAllPageInfo(locUrls, maxPages, function (done, total) {
-          setStatus(done + "/" + total + " ページ取得中...");
-        }).then(function (result) {
-          return { locUrlsLength: locUrls.length, result: result };
-        });
-      })
-      .then(function (data) {
-        pages = data.result.results;
+    setStatus("0/" + maxPages + " ページ取得中...");
+    crawlSite(startUrl, maxPages, function (done, total) {
+      setStatus(done + "/" + total + " ページ取得中...");
+    })
+      .then(function (result) {
+        pages = result.results;
         var failCount = pages.filter(function (p) { return p.error; }).length;
         var msg = "完了: " + pages.length + "件取得";
         if (failCount) msg += "（うち" + failCount + "件は取得失敗）";
-        if (data.result.truncated) {
-          msg +=
-            "｜サイトマップには" + data.locUrlsLength + "件のページがありますが、上限" +
-            maxPages + "件までを取得しました。";
+        if (result.truncated) {
+          msg += "｜上限" + maxPages + "件まで取得しました（サイト内にさらにページがある可能性があります）。";
         }
         setStatus(msg);
         renderAll();
